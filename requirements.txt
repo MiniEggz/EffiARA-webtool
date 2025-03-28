@@ -1,0 +1,8 @@
+effiara
+plotly
+matplotlib
+networkx
+numpy
+pandas
+seaborn
+streamlit
