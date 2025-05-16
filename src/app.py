@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import os
 import zipfile
@@ -423,9 +424,18 @@ def distribute_samples():
             st.error(f"Error processing the uploaded file: {e}")
 
 
+def hash_file(file):
+    return hashlib.sha256(file.getvalue()).hexdigest()
+
+
 def extract_zip_once(uploaded_zip):
-    if "extracted_files" in st.session_state:
+    # check whether new file
+    file_hash = hash_file(uploaded_zip)
+    if "upload_hash" in st.session_state and st.session_state.upload_hash == file_hash:
+        st.success("Using same file as previously loaded.")
         return st.session_state.extracted_files, st.session_state.temp_dir
+    else:
+        st.success("Loading new file...")
 
     # create temp directory and store so no extra creations
     temp_dir = TemporaryDirectory()
@@ -445,10 +455,53 @@ def extract_zip_once(uploaded_zip):
             if file.endswith(".csv"):
                 csv_files.append(os.path.join(root, file))
 
+    st.session_state.upload_hash = file_hash
     st.session_state.extracted_files = csv_files
     st.session_state.temp_dir = temp_dir  # keep reference to prevent cleanup
 
     return csv_files, temp_dir
+
+
+def rename_user_cols(
+    annotations_dict,
+    common_column_actions,
+    renaming_mode,
+    templated_actions,
+    user_specific_actions,
+):
+    # rename columns in each df
+    for user, df in annotations_dict.items():
+        rename_map = {}
+
+        # common columns
+        for col, config in common_column_actions.items():
+            if config["action"] == "Keep Common":
+                rename_map[col] = config["new_name"]
+            elif config["action"] == "Make User Specific":
+                new_col = f"{user}_{config['new_name']}"
+                rename_map[col] = new_col
+            elif config["action"] == "Remove":
+                df.drop(columns=[col], inplace=True, errors="ignore")
+
+        # user-specific columns
+        if renaming_mode == "Use Template":
+            assert isinstance(templated_actions, dict)
+            for col, action in templated_actions.items():
+                col_name = col.replace("ANNOTATOR", user)
+                if action["keep"]:
+                    rename_map[col_name] = action["new_name"].replace("ANNOTATOR", user)
+                else:
+                    df.drop(columns=[col_name], inplace=True)
+        else:
+            if user in user_specific_actions:
+                for col, config in user_specific_actions[user].items():
+                    if not config["keep"]:
+                        df.drop(columns=[col], inplace=True, errors="ignore")
+                    else:
+                        rename_map[col] = config["new_name"]
+
+        df.rename(columns=rename_map, inplace=True)
+    return annotations_dict
 
 
 def prepare_data():
@@ -473,7 +526,10 @@ def prepare_data():
         # get selected files only
         selected_files = [path for path, checked in include_flags.items() if checked]
         st.write("CSV files to be used:")
-        selected_display = [os.path.relpath(full_path, os.path.commonpath(csv_files)) for full_path in selected_files]
+        selected_display = [
+            os.path.relpath(full_path, os.path.commonpath(csv_files))
+            for full_path in selected_files
+        ]
         st.write(", ".join(selected_display))
 
         included_files = [f for f, include in include_flags.items() if include]
@@ -508,7 +564,7 @@ def prepare_data():
             common_column_actions[col] = {"new_name": new_name, "action": action}
             st.divider()
 
-        if st.button("Save Common Column Changes"):
+        if st.button("Preview Common Column Changes"):
             st.markdown("### Preview: Common Column Changes")
             for col, config in common_column_actions.items():
                 action = config["action"]
@@ -568,7 +624,7 @@ def prepare_data():
                         "keep": keep,
                     }
 
-                if st.button("Save Template Column Changes"):
+                if st.button("Preview Template Column Changes"):
                     st.markdown(
                         "### Preview: User-Specific Column Changes (via template)"
                     )
@@ -618,7 +674,7 @@ def prepare_data():
 
                 st.divider()
 
-            if st.button("Save User-Specific Column Changes"):
+            if st.button("Preview User-Specific Column Changes"):
                 st.markdown("### Preview: User-Specific Column Changes")
                 for user, col_dict in user_specific_actions.items():
                     st.write(f"User: `{user}`")
@@ -630,113 +686,83 @@ def prepare_data():
                         else:
                             st.write(f"`{col}` will be removed.")
 
-        if st.button("Rename Columns"):
-            st.session_state.rename_button_press = True
-
-            # rename columns in each df
-            for user, df in annotations_dict.items():
-                rename_map = {}
-
-                # common columns
-                for col, config in common_column_actions.items():
-                    if config["action"] == "Keep Common":
-                        rename_map[col] = config["new_name"]
-                    elif config["action"] == "Make User Specific":
-                        new_col = f"{user}_{config['new_name']}"
-                        rename_map[col] = new_col
-                    elif config["action"] == "Remove":
-                        df.drop(columns=[col], inplace=True, errors="ignore")
-
-                # user-specific columns
-                if renaming_mode == "Use Template":
-                    assert isinstance(templated_actions, dict)
-                    for col, action in templated_actions.items():
-                        col_name = col.replace("ANNOTATOR", user)
-                        if action["keep"]:
-                            rename_map[col_name] = action["new_name"].replace(
-                                "ANNOTATOR", user
-                            )
-                        else:
-                            df.drop(columns=[col_name], inplace=True)
-                else:
-                    if user in user_specific_actions:
-                        for col, config in user_specific_actions[user].items():
-                            if not config["keep"]:
-                                df.drop(columns=[col], inplace=True, errors="ignore")
-                            else:
-                                rename_map[col] = config["new_name"]
-
-                df.rename(columns=rename_map, inplace=True)
-            st.success("Columns renamed!")
-        if (
-            "rename_button_press" in st.session_state
-            and st.session_state.rename_button_press
-        ):
-
-            # move reannotations to re_ prefix cols
-            def move_to_re_cols(df, exclude_cols):
-                if "is_reannotation" not in df.columns:
-                    return df
-                cols_to_prefix = [c for c in df.columns if c not in exclude_cols]
-                for col in cols_to_prefix:
-                    re_col = f"re_{col}"
-                    if re_col not in df.columns:
-                        df[re_col] = None
-                    df.loc[df["is_reannotation"] == True, re_col] = df.loc[
-                        df["is_reannotation"] == True, col
-                    ]
-                    df.loc[df["is_reannotation"] == True, col] = None
-                return df
-
-            rename_reannotations = st.radio(
-                "Do you want to move all reannotations to separate columns?",
-                ("Yes", "No"),
-                index=0,
+        if st.button("Check Column Renaming"):
+            annotations_dict = rename_user_cols(
+                annotations_dict,
+                common_column_actions,
+                renaming_mode,
+                templated_actions,
+                user_specific_actions,
             )
+            for df in annotations_dict.values():
+                st.dataframe(df.head())
+            st.success("Columns renamed!")
 
-            if st.button("GO"):
-                st.session_state.reanno_button_press = True
-                if rename_reannotations == "Yes":
-                    exclude_cols = ["sample_id", "is_reannotation"] + [
-                        config["new_name"]
-                        for col, config in common_column_actions.items()
-                        if config["action"] == "Keep Common"
-                    ]
-                    annotations_dict = {
-                        user: move_to_re_cols(df.copy(), exclude_cols)
-                        for user, df in annotations_dict.items()
-                    }
-                    st.write("Reannotations prepended with `re_`!")
-                else:
-                    st.write("Skipping reannotation column separation.")
+        # move reannotations to re_ prefix cols
+        def move_to_re_cols(df, exclude_cols):
+            if "is_reannotation" not in df.columns:
+                return df
+            cols_to_prefix = [c for c in df.columns if c not in exclude_cols]
+            for col in cols_to_prefix:
+                re_col = f"re_{col}"
+                if re_col not in df.columns:
+                    df[re_col] = None
+                df.loc[df["is_reannotation"] == True, re_col] = df.loc[
+                    df["is_reannotation"] == True, col
+                ]
+                df.loc[df["is_reannotation"] == True, col] = None
+            return df
 
-            if (
-                "reanno_button_press" in st.session_state
-                and st.session_state.reanno_button_press
-            ):
-                if st.button("Merge Dataset"):
-                    # merge all dataframes by sample_id
-                    st.markdown("## Merging DataFrames...")
-                    st.warning("Please be patient, this may take some time.")
+        rename_reannotations = st.radio(
+            "Do you want to move all reannotations to separate columns?",
+            ("Yes", "No"),
+            index=0,
+        )
 
-                    try:
-                        merged_df = concat_annotations(annotations_dict)
-                        st.success("Merged dataset created!")
-                        st.dataframe(merged_df.head())
-                        with NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
-                            merged_df.to_csv(tmp.name, index=False)
-                            tmp_path = tmp.name
-                        with open(tmp_path, "rb") as f:
-                            st.download_button(
-                                label="Download",
-                                data=f,
-                                file_name="effidataset.csv",
-                                mime="text/csv",
-                            )
-                    except:
-                        st.warning(
-                            "Cannot merge. Check 'sample_id' column is available for each data point."
-                        )
+        if rename_reannotations == "Yes":
+            exclude_cols = ["sample_id", "is_reannotation"] + [
+                config["new_name"]
+                for col, config in common_column_actions.items()
+                if config["action"] == "Keep Common"
+            ]
+            annotations_dict = {
+                user: move_to_re_cols(df.copy(), exclude_cols)
+                for user, df in annotations_dict.items()
+            }
+            st.write("Reannotations will be prepended with `re_`!")
+        else:
+            st.write("Skipping reannotation column separation.")
+
+        if st.button("Merge Dataset"):
+            # merge all dataframes by sample_id
+            st.markdown("## Merging DataFrames...")
+            st.warning("Please be patient, this may take some time.")
+
+            try:
+                annotations_dict = rename_user_cols(
+                    annotations_dict,
+                    common_column_actions,
+                    renaming_mode,
+                    templated_actions,
+                    user_specific_actions,
+                )
+                merged_df = concat_annotations(annotations_dict)
+                st.success("Merged dataset created!")
+                st.dataframe(merged_df.head())
+                with NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
+                    merged_df.to_csv(tmp.name, index=False)
+                    tmp_path = tmp.name
+                with open(tmp_path, "rb") as f:
+                    st.download_button(
+                        label="Download",
+                        data=f,
+                        file_name="effidataset.csv",
+                        mime="text/csv",
+                    )
+            except:
+                st.warning(
+                    "Cannot merge. Check 'sample_id' column is available for each data point."
+                )
 
 
 def merge_dataset():
@@ -1234,9 +1260,7 @@ def main():
 
     elif workflow == workflows[2]:
         st.sidebar.subheader("Steps of Dataset Compilation")
-        step = st.sidebar.radio(
-            "Go to Step", ["Prepare Data"]
-        )
+        step = st.sidebar.radio("Go to Step", ["Prepare Data"])
 
         # TODO: add instructions
 
