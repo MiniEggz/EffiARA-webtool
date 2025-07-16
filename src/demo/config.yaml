@@ -1,0 +1,32 @@
+seed: 42
+
+raw_data:
+  num_samples: 2160
+  num_classes: 3
+  save_path: "raw_data.csv"
+
+# can handle this through webtool
+distribution:
+  distributor:
+    annotators:
+      - alan
+      - barbara
+      - charlie
+      - debra
+      - elliot
+    time_available: 10
+    annotation_rate: 60
+    double_proportion: 0.33
+    re_proportion: 0.5
+  raw_data_path: "raw_data.csv"
+  save_path: "./distributed"
+
+annotate:
+  data_dir: "./annotation_projects"
+  save_dir: "./annotated"
+  accuracy:
+    alan: 0.93
+    barbara: 0.9
+    charlie: 0.86
+    debra: 0.98
+    elliot: 0.7
